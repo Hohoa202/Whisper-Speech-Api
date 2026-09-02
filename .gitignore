@@ -1,0 +1,5 @@
+.venv/
+models/whisper
+.env
+__pycache__/
+*.pyc
