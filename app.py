@@ -4,6 +4,7 @@ import time
 import logging
 import tempfile
 import subprocess
+import asyncio
 from enum import Enum
 
 import torch
@@ -26,7 +27,12 @@ logger = logging.getLogger("speech-api")
 # FASTAPI
 # ============================================================
 
-app = FastAPI(title="Whisper Speech API", version="1.0.0")
+app = FastAPI(title="Whisper Speech API", version="1.1.0")
+
+# Only one GPU job runs at a time. Uploads can still be received concurrently.
+gpu_lock = asyncio.Lock()
+waiting_jobs = 0
+waiting_jobs_lock = asyncio.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -302,127 +308,124 @@ async def transcribe(
         logger.info("File size : %.2f MB", len(data) / 1024 / 1024)
         logger.info("Temp file : %s", audio_path)
 
-        # ====================================================
-        # AUDIO PREPROCESS
-        # ====================================================
+        global waiting_jobs
+        async with waiting_jobs_lock:
+            waiting_jobs += 1
+            queue_position = waiting_jobs
+        logger.info("GPU queue position: %d", queue_position)
 
-        logger.info("")
-        logger.info("---------- PREPROCESS START --------")
+        try:
+            async with gpu_lock:
+                async with waiting_jobs_lock:
+                    waiting_jobs -= 1
+                queue_wait_elapsed = time.perf_counter() - request_started
+                logger.info("GPU acquired after %.2f sec", queue_wait_elapsed)
 
-        preprocess_started = time.perf_counter()
-        processed_audio_path = preprocess_audio(audio_path)
-        preprocess_elapsed = time.perf_counter() - preprocess_started
+                # ====================================================
+                # AUDIO PREPROCESS
+                # ====================================================
 
-        logger.info("Processed audio : %s", processed_audio_path)
-        logger.info("Filters         : highpass 80Hz + afftdn + dynaudnorm")
-        logger.info("Format          : WAV PCM 16-bit / mono / 16 kHz")
-        logger.info("Preprocess time : %.2f sec", preprocess_elapsed)
-        logger.info("---------- PREPROCESS END ----------")
+                logger.info("")
+                logger.info("---------- PREPROCESS START --------")
+                preprocess_started = time.perf_counter()
+                processed_audio_path = await asyncio.to_thread(preprocess_audio, audio_path)
+                preprocess_elapsed = time.perf_counter() - preprocess_started
+                logger.info("Processed audio : %s", processed_audio_path)
+                logger.info("Filters         : highpass 80Hz + afftdn + dynaudnorm")
+                logger.info("Format          : WAV PCM 16-bit / mono / 16 kHz")
+                logger.info("Preprocess time : %.2f sec", preprocess_elapsed)
+                logger.info("---------- PREPROCESS END ----------")
 
-        # ====================================================
-        # LOAD WHISPER
-        # ====================================================
+                # ====================================================
+                # LOAD WHISPER
+                # ====================================================
 
-        model_instance = get_whisper_model(model_name)
+                model_instance = await asyncio.to_thread(get_whisper_model, model_name)
 
-        # ====================================================
-        # LANGUAGE
-        # ====================================================
+                # ====================================================
+                # LANGUAGE
+                # ====================================================
 
-        whisper_language = None if language_value == "auto" else language_value
+                whisper_language = None if language_value == "auto" else language_value
 
-        # ====================================================
-        # WHISPER
-        # ====================================================
+                # ====================================================
+                # WHISPER
+                # ====================================================
 
-        logger.info("")
-        logger.info("---------- WHISPER START ----------")
+                logger.info("")
+                logger.info("---------- WHISPER START ----------")
+                whisper_started = time.perf_counter()
+                transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled}
+                if vad_enabled:
+                    transcribe_kwargs["vad_parameters"] = {"threshold": vad_threshold, "min_speech_duration_ms": vad_min_speech_ms, "min_silence_duration_ms": vad_min_silence_ms, "speech_pad_ms": vad_speech_pad_ms}
 
-        whisper_started = time.perf_counter()
+                def run_whisper():
+                    segments, info = model_instance.transcribe(processed_audio_path, **transcribe_kwargs)
+                    return list(segments), info
 
-        transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled}
-        if vad_enabled:
-            transcribe_kwargs["vad_parameters"] = {
-                "threshold": vad_threshold,
-                "min_speech_duration_ms": vad_min_speech_ms,
-                "min_silence_duration_ms": vad_min_silence_ms,
-                "speech_pad_ms": vad_speech_pad_ms
-            }
+                segments, info = await asyncio.to_thread(run_whisper)
+                whisper_segments = []
+                word_count = 0
 
-        segments, info = model_instance.transcribe(processed_audio_path, **transcribe_kwargs)
+                for index, segment in enumerate(segments, start=1):
+                    segment_words = []
+                    if segment.words:
+                        for word in segment.words:
+                            if word.start is None or word.end is None:
+                                continue
+                            segment_words.append({"start": word.start, "end": word.end, "text": word.word})
+                            word_count += 1
+                    whisper_segments.append({"start": segment.start, "end": segment.end, "text": segment.text.strip(), "words": segment_words})
+                    logger.info("W[%03d] %.2f -> %.2f | %s", index, segment.start, segment.end, segment.text.strip())
 
-        whisper_segments = []
-        word_count = 0
+                whisper_elapsed = time.perf_counter() - whisper_started
+                logger.info("")
+                logger.info("Detected language    : %s", info.language)
+                logger.info("Language probability : %.4f", info.language_probability)
+                logger.info("Audio duration       : %.2f sec", info.duration)
+                logger.info("Whisper segments     : %d", len(whisper_segments))
+                logger.info("Whisper words        : %d", word_count)
+                logger.info("Whisper processing   : %.2f sec", whisper_elapsed)
+                logger.info("---------- WHISPER END ------------")
 
-        for index, segment in enumerate(segments, start=1):
-            segment_words = []
+                # ====================================================
+                # CONVERT FOR PYANNOTE
+                # ====================================================
 
-            if segment.words:
-                for word in segment.words:
-                    if word.start is None or word.end is None:
-                        continue
+                logger.info("")
+                logger.info("---------- AUDIO CONVERT START -----")
+                convert_started = time.perf_counter()
+                diarization_path = processed_audio_path
+                convert_elapsed = time.perf_counter() - convert_started
+                logger.info("Pyannote audio : %s", diarization_path)
+                logger.info("Format         : WAV PCM 16-bit / mono / 16 kHz")
+                logger.info("Reuse preprocessed WAV (no second conversion)")
+                logger.info("---------- AUDIO CONVERT END -------")
 
-                    segment_words.append({
-                        "start": word.start,
-                        "end": word.end,
-                        "text": word.word
-                    })
-                    word_count += 1
+                # ====================================================
+                # PYANNOTE
+                # ====================================================
 
-            whisper_segments.append({
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text.strip(),
-                "words": segment_words
-            })
+                logger.info("")
+                logger.info("---------- PYANNOTE START ---------")
+                diarization_started = time.perf_counter()
 
-            logger.info("W[%03d] %.2f -> %.2f | %s", index, segment.start, segment.end, segment.text.strip())
+                def run_diarization():
+                    if num_speakers is not None:
+                        logger.info("Speaker mode : fixed (%d)", num_speakers)
+                        return diarization_pipeline(diarization_path, num_speakers=num_speakers)
+                    logger.info("Speaker mode : auto")
+                    return diarization_pipeline(diarization_path)
 
-        whisper_elapsed = time.perf_counter() - whisper_started
-
-        logger.info("")
-        logger.info("Detected language    : %s", info.language)
-        logger.info("Language probability : %.4f", info.language_probability)
-        logger.info("Audio duration       : %.2f sec", info.duration)
-        logger.info("Whisper segments     : %d", len(whisper_segments))
-        logger.info("Whisper words        : %d", word_count)
-        logger.info("Whisper processing   : %.2f sec", whisper_elapsed)
-        logger.info("---------- WHISPER END ------------")
-
-        # ====================================================
-        # CONVERT FOR PYANNOTE
-        # ====================================================
-
-        logger.info("")
-        logger.info("---------- AUDIO CONVERT START -----")
-
-        convert_started = time.perf_counter()
-        diarization_path = processed_audio_path
-        convert_elapsed = time.perf_counter() - convert_started
-
-        logger.info("Pyannote audio : %s", diarization_path)
-        logger.info("Format         : WAV PCM 16-bit / mono / 16 kHz")
-        logger.info("Reuse preprocessed WAV (no second conversion)")
-        logger.info("---------- AUDIO CONVERT END -------")
-
-        # ====================================================
-        # PYANNOTE
-        # ====================================================
-
-        logger.info("")
-        logger.info("---------- PYANNOTE START ---------")
-
-        diarization_started = time.perf_counter()
-
-        if num_speakers is not None:
-            logger.info("Speaker mode : fixed (%d)", num_speakers)
-            output = diarization_pipeline(diarization_path, num_speakers=num_speakers)
-        else:
-            logger.info("Speaker mode : auto")
-            output = diarization_pipeline(diarization_path)
-
-        diarization = output.speaker_diarization
-        diarization_elapsed = time.perf_counter() - diarization_started
+                output = await asyncio.to_thread(run_diarization)
+                diarization = output.speaker_diarization
+                diarization_elapsed = time.perf_counter() - diarization_started
+        except BaseException:
+            if gpu_lock.locked() is False:
+                async with waiting_jobs_lock:
+                    if waiting_jobs > 0:
+                        waiting_jobs -= 1
+            raise
 
         # ====================================================
         # LOG SPEAKER TIMELINE
@@ -503,6 +506,7 @@ async def transcribe(
 
         logger.info("")
         logger.info("============= PERFORMANCE =============")
+        logger.info("Queue wait : %.2f sec", queue_wait_elapsed)
         logger.info("Audio      : %.2f sec", info.duration)
         logger.info("Preprocess : %.2f sec", preprocess_elapsed)
         logger.info("Whisper    : %.2f sec", whisper_elapsed)
@@ -539,6 +543,7 @@ async def transcribe(
             "speakers": speakers,
             "wordCount": word_count,
             "processingTime": {
+                "queueWait": round(queue_wait_elapsed, 3),
                 "preprocess": round(preprocess_elapsed, 3),
                 "whisper": round(whisper_elapsed, 3),
                 "audioConversion": round(convert_elapsed, 3),
