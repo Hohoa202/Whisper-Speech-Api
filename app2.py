@@ -10,8 +10,7 @@ import torch
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
-from pyannote.core import Segment
+from nemo.collections.asr.models import SortformerEncLabelModel
 
 
 # ============================================================
@@ -74,21 +73,28 @@ logger.info("============================================")
 
 
 # ============================================================
-# PYANNOTE
+# NEMO SORTFORMER DIARIZATION
 # ============================================================
 
-PYANNOTE_MODEL = "./models/pyannote-community-1"
+SORTFORMER_MODEL = os.getenv("SORTFORMER_MODEL", "nvidia/diar_sortformer_4spk-v1")
 
-logger.info("Loading Pyannote model...")
-logger.info("Pyannote path: %s", PYANNOTE_MODEL)
+logger.info("Loading NeMo Sortformer model...")
+logger.info("Sortformer model: %s", SORTFORMER_MODEL)
 
-pyannote_start = time.perf_counter()
-diarization_pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL)
+sortformer_start = time.perf_counter()
+
+# For a local .nemo checkpoint, set SORTFORMER_MODEL to its file path.
+if os.path.isfile(SORTFORMER_MODEL) and SORTFORMER_MODEL.lower().endswith(".nemo"):
+    diarization_model = SortformerEncLabelModel.restore_from(SORTFORMER_MODEL)
+else:
+    diarization_model = SortformerEncLabelModel.from_pretrained(SORTFORMER_MODEL)
+
+diarization_model.eval()
 
 if DEVICE == "cuda":
-    diarization_pipeline.to(torch.device("cuda"))
+    diarization_model = diarization_model.to(torch.device("cuda"))
 
-logger.info("Pyannote loaded in %.2f sec", time.perf_counter() - pyannote_start)
+logger.info("Sortformer loaded in %.2f sec", time.perf_counter() - sortformer_start)
 
 
 # ============================================================
@@ -211,20 +217,89 @@ def safe_remove(path: str):
 
 
 # ============================================================
-# SPEAKER MATCHING
+# SORTFORMER OUTPUT + SPEAKER MATCHING
 # ============================================================
 
-def find_segment_speaker(diarization, start, end):
-    if start is None or end is None:
+def normalize_speaker_label(raw_speaker) -> str:
+    value = str(raw_speaker).strip()
+    digits = "".join(ch for ch in value if ch.isdigit())
+
+    if digits:
+        return f"SPEAKER_{int(digits):02d}"
+
+    value = value.upper().replace(" ", "_")
+    return value if value.startswith("SPEAKER_") else f"SPEAKER_{value}"
+
+
+def parse_sortformer_segments(predicted_segments):
+    """
+    Convert NeMo Sortformer output into:
+      [{"start": float, "end": float, "speaker": "SPEAKER_00"}, ...]
+
+    NeMo versions may return either:
+    - list[list[str]] for batched audio, where each string is "start end speaker"
+    - list[str]
+    - objects exposing start/end/speaker attributes
+    """
+    if predicted_segments is None:
+        return []
+
+    raw = predicted_segments
+
+    # diarize(audio=[single_file]) commonly returns one outer item for the file.
+    if isinstance(raw, (list, tuple)) and len(raw) == 1 and isinstance(raw[0], (list, tuple)):
+        raw = raw[0]
+
+    parsed = []
+
+    for item in raw:
+        start = end = speaker = None
+
+        if isinstance(item, str):
+            parts = item.strip().split()
+            if len(parts) >= 3:
+                start, end, speaker = parts[0], parts[1], parts[2]
+        elif isinstance(item, dict):
+            start = item.get("start")
+            end = item.get("end")
+            speaker = item.get("speaker")
+        else:
+            start = getattr(item, "start", None)
+            end = getattr(item, "end", None)
+            speaker = getattr(item, "speaker", None)
+
+        if start is None or end is None or speaker is None:
+            logger.warning("Skip unknown Sortformer segment format: %r", item)
+            continue
+
+        parsed.append({
+            "start": float(start),
+            "end": float(end),
+            "speaker": normalize_speaker_label(speaker)
+        })
+
+    parsed.sort(key=lambda x: (x["start"], x["end"], x["speaker"]))
+    return parsed
+
+
+def find_segment_speaker(diarization_segments, start, end):
+    if start is None or end is None or end <= start:
         return "UNKNOWN"
 
-    cropped = diarization.crop(Segment(start, end))
-    speakers = cropped.labels()
+    overlap_by_speaker = {}
 
-    if not speakers:
+    for diar in diarization_segments:
+        overlap = max(0.0, min(end, diar["end"]) - max(start, diar["start"]))
+        if overlap <= 0:
+            continue
+
+        speaker = diar["speaker"]
+        overlap_by_speaker[speaker] = overlap_by_speaker.get(speaker, 0.0) + overlap
+
+    if not overlap_by_speaker:
         return "UNKNOWN"
 
-    return max(speakers, key=lambda speaker: cropped.label_duration(speaker))
+    return max(overlap_by_speaker, key=overlap_by_speaker.get)
 
 
 # ============================================================
@@ -238,6 +313,7 @@ def root():
         "device": DEVICE,
         "computeType": COMPUTE_TYPE,
         "currentWhisperModel": current_whisper_model,
+        "diarizationModel": SORTFORMER_MODEL,
         "models": ["small", "large-v3", "large-v3-turbo"],
         "languages": ["auto", "ja", "en", "vi"]
     }
@@ -257,13 +333,12 @@ async def transcribe(
     request_started = time.perf_counter()
     audio_path = None
     processed_audio_path = None
-    diarization_path = None
 
     language_value = language.value
     model_name = model.value
 
-    if num_speakers is not None and num_speakers < 1:
-        raise HTTPException(status_code=400, detail="num_speakers must be greater than 0")
+    if num_speakers is not None and not 1 <= num_speakers <= 4:
+        raise HTTPException(status_code=400, detail="Sortformer supports 1 to 4 speakers")
 
     logger.info("")
     logger.info("============================================")
@@ -335,7 +410,7 @@ async def transcribe(
             word_timestamps=True,
             vad_filter=True,
             vad_parameters=dict(
-                threshold=0.2,
+                threshold=0.3,
                 min_speech_duration_ms=50,
                 min_silence_duration_ms=500,
                 speech_pad_ms=300
@@ -381,58 +456,44 @@ async def transcribe(
         logger.info("---------- WHISPER END ------------")
 
         # ====================================================
-        # CONVERT FOR PYANNOTE
+        # NEMO SORTFORMER DIARIZATION
         # ====================================================
 
         logger.info("")
-        logger.info("---------- AUDIO CONVERT START -----")
-
-        convert_started = time.perf_counter()
-        diarization_path = processed_audio_path
-        convert_elapsed = time.perf_counter() - convert_started
-
-        logger.info("Pyannote audio : %s", diarization_path)
-        logger.info("Format         : WAV PCM 16-bit / mono / 16 kHz")
-        logger.info("Reuse preprocessed WAV (no second conversion)")
-        logger.info("---------- AUDIO CONVERT END -------")
-
-        # ====================================================
-        # PYANNOTE
-        # ====================================================
-
-        logger.info("")
-        logger.info("---------- PYANNOTE START ---------")
+        logger.info("---------- SORTFORMER START -------")
 
         diarization_started = time.perf_counter()
 
         if num_speakers is not None:
-            logger.info("Speaker mode : fixed (%d)", num_speakers)
-            output = diarization_pipeline(diarization_path, num_speakers=num_speakers)
-        else:
-            logger.info("Speaker mode : auto")
-            output = diarization_pipeline(diarization_path)
+            logger.info("Requested speakers : %d", num_speakers)
+            logger.info("Note: Sortformer auto-detects speakers; num_speakers is kept only for API compatibility")
 
-        diarization = output.speaker_diarization
+        # Use the same preprocessed 16 kHz mono WAV as Whisper.
+        predicted_segments = diarization_model.diarize(
+            audio=[processed_audio_path],
+            batch_size=1
+        )
+
+        diarization_segments = parse_sortformer_segments(predicted_segments)
         diarization_elapsed = time.perf_counter() - diarization_started
 
-        # ====================================================
-        # LOG SPEAKER TIMELINE
-        # ====================================================
-
         logger.info("Speaker timeline:")
-        diarization_count = 0
+        for index, item in enumerate(diarization_segments, start=1):
+            logger.info(
+                "D[%03d] %.2f -> %.2f | %s",
+                index,
+                item["start"],
+                item["end"],
+                item["speaker"]
+            )
 
-        for turn, speaker in diarization:
-            diarization_count += 1
-            logger.info("D[%03d] %.2f -> %.2f | %s", diarization_count, turn.start, turn.end, speaker)
-
-        speakers = diarization.labels()
+        speakers = sorted({item["speaker"] for item in diarization_segments})
 
         logger.info("")
-        logger.info("Speaker count : %d", len(speakers))
-        logger.info("Speakers      : %s", speakers)
-        logger.info("Pyannote processing: %.2f sec", diarization_elapsed)
-        logger.info("---------- PYANNOTE END -----------")
+        logger.info("Speaker count          : %d", len(speakers))
+        logger.info("Speakers               : %s", speakers)
+        logger.info("Sortformer processing  : %.2f sec", diarization_elapsed)
+        logger.info("---------- SORTFORMER END ---------")
 
         # ====================================================
         # ASSIGN WHISPER SEGMENT -> SPEAKER
@@ -446,7 +507,7 @@ async def transcribe(
         unknown_count = 0
 
         for segment in whisper_segments:
-            speaker = find_segment_speaker(diarization, segment["start"], segment["end"])
+            speaker = find_segment_speaker(diarization_segments, segment["start"], segment["end"])
 
             if speaker == "UNKNOWN":
                 unknown_count += 1
@@ -497,8 +558,7 @@ async def transcribe(
         logger.info("Audio      : %.2f sec", info.duration)
         logger.info("Preprocess : %.2f sec", preprocess_elapsed)
         logger.info("Whisper    : %.2f sec", whisper_elapsed)
-        logger.info("Conversion : %.2f sec", convert_elapsed)
-        logger.info("Pyannote   : %.2f sec", diarization_elapsed)
+        logger.info("Sortformer : %.2f sec", diarization_elapsed)
         logger.info("Assignment : %.3f sec", assign_elapsed)
         logger.info("TOTAL      : %.2f sec", total_elapsed)
         logger.info("RTF        : %.3f", rtf)
@@ -525,7 +585,6 @@ async def transcribe(
             "processingTime": {
                 "preprocess": round(preprocess_elapsed, 3),
                 "whisper": round(whisper_elapsed, 3),
-                "audioConversion": round(convert_elapsed, 3),
                 "diarization": round(diarization_elapsed, 3),
                 "speakerAssignment": round(assign_elapsed, 3),
                 "total": round(total_elapsed, 3),
@@ -540,5 +599,5 @@ async def transcribe(
         logger.exception("Transcription failed: %s", str(ex))
         raise HTTPException(status_code=500, detail=str(ex))
     finally:
-        safe_remove(diarization_path)
+        safe_remove(processed_audio_path)
         safe_remove(audio_path)
