@@ -252,7 +252,12 @@ async def transcribe(
     file: UploadFile = File(...),
     language: LanguageName = Form(LanguageName.ja),
     model: WhisperModelName = Form(WhisperModelName.small),
-    num_speakers: int | None = Form(None)
+    num_speakers: int | None = Form(None),
+    vad_enabled: bool = Form(True),
+    vad_threshold: float = Form(0.2),
+    vad_min_speech_ms: int = Form(50),
+    vad_min_silence_ms: int = Form(500),
+    vad_speech_pad_ms: int = Form(300)
 ):
     request_started = time.perf_counter()
     audio_path = None
@@ -264,6 +269,10 @@ async def transcribe(
 
     if num_speakers is not None and num_speakers < 1:
         raise HTTPException(status_code=400, detail="num_speakers must be greater than 0")
+    if not 0 <= vad_threshold <= 1:
+        raise HTTPException(status_code=400, detail="vad_threshold must be between 0 and 1")
+    if vad_min_speech_ms < 0 or vad_min_silence_ms < 0 or vad_speech_pad_ms < 0:
+        raise HTTPException(status_code=400, detail="VAD duration settings must be >= 0")
 
     logger.info("")
     logger.info("============================================")
@@ -272,6 +281,9 @@ async def transcribe(
     logger.info("Model    : %s", model_name)
     logger.info("Language : %s", language_value)
     logger.info("Speakers : %s", num_speakers if num_speakers is not None else "auto")
+    logger.info("VAD      : %s", "on" if vad_enabled else "off")
+    if vad_enabled:
+        logger.info("VAD cfg  : threshold=%.2f, minSpeech=%dms, minSilence=%dms, pad=%dms", vad_threshold, vad_min_speech_ms, vad_min_silence_ms, vad_speech_pad_ms)
     logger.info("Device   : %s", DEVICE)
     logger.info("============================================")
 
@@ -328,19 +340,16 @@ async def transcribe(
 
         whisper_started = time.perf_counter()
 
-        segments, info = model_instance.transcribe(
-            processed_audio_path,
-            language=whisper_language,
-            beam_size=5,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters=dict(
-                threshold=0.2,
-                min_speech_duration_ms=50,
-                min_silence_duration_ms=500,
-                speech_pad_ms=300
-            )
-        )
+        transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled}
+        if vad_enabled:
+            transcribe_kwargs["vad_parameters"] = {
+                "threshold": vad_threshold,
+                "min_speech_duration_ms": vad_min_speech_ms,
+                "min_silence_duration_ms": vad_min_silence_ms,
+                "speech_pad_ms": vad_speech_pad_ms
+            }
+
+        segments, info = model_instance.transcribe(processed_audio_path, **transcribe_kwargs)
 
         whisper_segments = []
         word_count = 0
@@ -516,6 +525,13 @@ async def transcribe(
             "model": model_name,
             "requestedLanguage": language_value,
             "requestedSpeakerCount": num_speakers,
+            "vad": {
+                "enabled": vad_enabled,
+                "threshold": vad_threshold if vad_enabled else None,
+                "minSpeechDurationMs": vad_min_speech_ms if vad_enabled else None,
+                "minSilenceDurationMs": vad_min_silence_ms if vad_enabled else None,
+                "speechPadMs": vad_speech_pad_ms if vad_enabled else None
+            },
             "detectedLanguage": info.language,
             "languageProbability": info.language_probability,
             "duration": info.duration,
