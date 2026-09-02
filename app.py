@@ -389,8 +389,8 @@ async def transcribe(
                 logger.info("")
                 logger.info("---------- WHISPER START ----------")
                 whisper_started = time.perf_counter()
-                # transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True, "initial_prompt": "句読点（、。！？）を適切に使用して、日本語の文章として文字起こししてください。"}
-                transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True}
+                transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True, "initial_prompt": "句読点（、。！？）を適切に使用して、日本語の文章として文字起こししてください。"}
+                # transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True}
                 if vad_enabled:
                     transcribe_kwargs["vad_parameters"] = {"threshold": vad_threshold, "min_speech_duration_ms": vad_min_speech_ms, "min_silence_duration_ms": vad_min_silence_ms, "speech_pad_ms": vad_speech_pad_ms}
 
