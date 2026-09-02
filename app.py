@@ -233,6 +233,40 @@ def find_segment_speaker(diarization, start, end):
     return max(speakers, key=lambda speaker: cropped.label_duration(speaker))
 
 
+def remap_speakers_by_first_appearance(items):
+    speaker_map = {}
+    next_id = 1
+    for item in items:
+        speaker = item["speaker"]
+        if speaker == "UNKNOWN":
+            continue
+        if speaker not in speaker_map:
+            speaker_map[speaker] = f"SPEAKER_{next_id:02d}"
+            next_id += 1
+        item["speaker"] = speaker_map[speaker]
+    return items, speaker_map
+
+
+def merge_same_speaker_segments(items, max_gap=1.0, max_duration=30.0):
+    if not items:
+        return []
+    merged = []
+    current = items[0].copy()
+    for item in items[1:]:
+        gap = item["start"] - current["end"]
+        current_text = current["text"].rstrip()
+        ends_sentence = current_text.endswith(("。", "！", "？", "!", "?"))
+        can_merge = item["speaker"] == current["speaker"] and item["speaker"] != "UNKNOWN" and gap <= max_gap and not ends_sentence and item["end"] - current["start"] <= max_duration
+        if can_merge:
+            current["end"] = item["end"]
+            current["text"] = current_text + item["text"].lstrip()
+        else:
+            merged.append(current)
+            current = item.copy()
+    merged.append(current)
+    return merged
+
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
@@ -355,7 +389,8 @@ async def transcribe(
                 logger.info("")
                 logger.info("---------- WHISPER START ----------")
                 whisper_started = time.perf_counter()
-                transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True, "initial_prompt": "句読点（、。！？）を適切に使用して、日本語の文章として文字起こししてください。"}
+                # transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True, "initial_prompt": "句読点（、。！？）を適切に使用して、日本語の文章として文字起こししてください。"}
+                transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True}
                 if vad_enabled:
                     transcribe_kwargs["vad_parameters"] = {"threshold": vad_threshold, "min_speech_duration_ms": vad_min_speech_ms, "min_silence_duration_ms": vad_min_silence_ms, "speech_pad_ms": vad_speech_pad_ms}
 
@@ -470,9 +505,13 @@ async def transcribe(
                 "text": segment["text"]
             })
 
+        raw_result_count = len(result)
+        result, speaker_map = remap_speakers_by_first_appearance(result)
+        result = merge_same_speaker_segments(result, max_gap=1.0, max_duration=30.0)
         assign_elapsed = time.perf_counter() - assign_started
 
-        logger.info("Segments assigned : %d", len(result))
+        logger.info("Segments assigned : %d", raw_result_count)
+        logger.info("Speaker remap     : %s", speaker_map)
         logger.info("Unknown segments  : %d", unknown_count)
         logger.info("Final segments    : %d", len(result))
         logger.info("Assign time       : %.3f sec", assign_elapsed)
@@ -539,8 +578,8 @@ async def transcribe(
             "detectedLanguage": info.language,
             "languageProbability": info.language_probability,
             "duration": info.duration,
-            "speakerCount": len(speakers),
-            "speakers": speakers,
+            "speakerCount": len(speaker_map),
+            "speakers": list(speaker_map.values()),
             "wordCount": word_count,
             "processingTime": {
                 "queueWait": round(queue_wait_elapsed, 3),
