@@ -251,23 +251,30 @@ def remap_speakers_by_first_appearance(items):
         item["speaker"] = speaker_map[speaker]
     return items, speaker_map
 
-
 def merge_same_speaker_segments(items, split_sentences=True, max_gap=1.0, max_duration=30.0):
     if not items:
         return []
+
     merged = []
     current = items[0].copy()
+
     for item in items[1:]:
         gap = item["start"] - current["end"]
         current_text = current["text"].rstrip()
+        current_duration = current["end"] - current["start"]
         ends_sentence = current_text.endswith(("。", "！", "？", "!", "?"))
-        can_merge = item["speaker"] == current["speaker"] and item["speaker"] != "UNKNOWN" and (not split_sentences or (gap <= max_gap and not ends_sentence and item["end"] - current["start"] <= max_duration))
+
+        same_speaker = item["speaker"] == current["speaker"] and item["speaker"] != "UNKNOWN"
+        should_split = split_sentences and (gap > max_gap or (current_duration >= max_duration and ends_sentence))
+        can_merge = same_speaker and not should_split
+
         if can_merge:
             current["end"] = item["end"]
             current["text"] = current_text + item["text"].lstrip()
         else:
             merged.append(current)
             current = item.copy()
+
     merged.append(current)
     return merged
 
