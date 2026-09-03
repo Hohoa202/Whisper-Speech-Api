@@ -84,17 +84,22 @@ logger.info("============================================")
 # ============================================================
 
 PYANNOTE_MODEL = "./models/pyannote-community-1"
+diarization_pipeline = None
 
-logger.info("Loading Pyannote model...")
-logger.info("Pyannote path: %s", PYANNOTE_MODEL)
 
-pyannote_start = time.perf_counter()
-diarization_pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL)
-
-if DEVICE == "cuda":
-    diarization_pipeline.to(torch.device("cuda"))
-
-logger.info("Pyannote loaded in %.2f sec", time.perf_counter() - pyannote_start)
+def get_diarization_pipeline():
+    global diarization_pipeline
+    if diarization_pipeline is not None:
+        logger.info("Reuse Pyannote model: %s", PYANNOTE_MODEL)
+        return diarization_pipeline
+    logger.info("Loading Pyannote model...")
+    logger.info("Pyannote path: %s", PYANNOTE_MODEL)
+    pyannote_start = time.perf_counter()
+    diarization_pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL)
+    if DEVICE == "cuda":
+        diarization_pipeline.to(torch.device("cuda"))
+    logger.info("Pyannote loaded in %.2f sec", time.perf_counter() - pyannote_start)
+    return diarization_pipeline
 
 
 # ============================================================
@@ -246,23 +251,30 @@ def remap_speakers_by_first_appearance(items):
         item["speaker"] = speaker_map[speaker]
     return items, speaker_map
 
-
-def merge_same_speaker_segments(items, max_gap=1.0, max_duration=30.0):
+def merge_same_speaker_segments(items, split_sentences=True, max_gap=1.0, max_duration=30.0):
     if not items:
         return []
+
     merged = []
     current = items[0].copy()
+
     for item in items[1:]:
         gap = item["start"] - current["end"]
         current_text = current["text"].rstrip()
+        current_duration = current["end"] - current["start"]
         ends_sentence = current_text.endswith(("。", "！", "？", "!", "?"))
-        can_merge = item["speaker"] == current["speaker"] and item["speaker"] != "UNKNOWN" and gap <= max_gap and not ends_sentence and item["end"] - current["start"] <= max_duration
+
+        same_speaker = item["speaker"] == current["speaker"] and item["speaker"] != "UNKNOWN"
+        should_split = split_sentences and (gap > max_gap or (current_duration >= max_duration and ends_sentence))
+        can_merge = same_speaker and not should_split
+
         if can_merge:
             current["end"] = item["end"]
             current["text"] = current_text + item["text"].lstrip()
         else:
             merged.append(current)
             current = item.copy()
+
     merged.append(current)
     return merged
 
@@ -293,6 +305,10 @@ async def transcribe(
     language: LanguageName = Form(LanguageName.ja),
     model: WhisperModelName = Form(WhisperModelName.small),
     num_speakers: int | None = Form(None),
+    speaker_diarization_enabled: bool = Form(True),
+    sentence_split_enabled: bool = Form(True),
+    max_gap: float = Form(1.0),
+    max_duration: float = Form(30.0),
     vad_enabled: bool = Form(True),
     vad_threshold: float = Form(0.2),
     vad_min_speech_ms: int = Form(50),
@@ -307,8 +323,12 @@ async def transcribe(
     language_value = language.value
     model_name = model.value
 
-    if num_speakers is not None and num_speakers < 1:
+    if speaker_diarization_enabled and num_speakers is not None and num_speakers < 1:
         raise HTTPException(status_code=400, detail="num_speakers must be greater than 0")
+    if sentence_split_enabled and max_gap < 0:
+        raise HTTPException(status_code=400, detail="max_gap must be >= 0")
+    if sentence_split_enabled and max_duration <= 0:
+        raise HTTPException(status_code=400, detail="max_duration must be greater than 0")
     if not 0 <= vad_threshold <= 1:
         raise HTTPException(status_code=400, detail="vad_threshold must be between 0 and 1")
     if vad_min_speech_ms < 0 or vad_min_silence_ms < 0 or vad_speech_pad_ms < 0:
@@ -320,7 +340,11 @@ async def transcribe(
     logger.info("File     : %s", file.filename)
     logger.info("Model    : %s", model_name)
     logger.info("Language : %s", language_value)
-    logger.info("Speakers : %s", num_speakers if num_speakers is not None else "auto")
+    logger.info("Diarization : %s", "on" if speaker_diarization_enabled else "off")
+    logger.info("Speakers    : %s", num_speakers if speaker_diarization_enabled and num_speakers is not None else "auto" if speaker_diarization_enabled else "disabled")
+    logger.info("Sentence split : %s", "on" if sentence_split_enabled else "off")
+    if sentence_split_enabled:
+        logger.info("Merge cfg      : maxGap=%.2fs, maxDuration=%.2fs", max_gap, max_duration)
     logger.info("VAD      : %s", "on" if vad_enabled else "off")
     if vad_enabled:
         logger.info("VAD cfg  : threshold=%.2f, minSpeech=%dms, minSilence=%dms, pad=%dms", vad_threshold, vad_min_speech_ms, vad_min_silence_ms, vad_speech_pad_ms)
@@ -427,34 +451,41 @@ async def transcribe(
                 # CONVERT FOR PYANNOTE
                 # ====================================================
 
-                logger.info("")
-                logger.info("---------- AUDIO CONVERT START -----")
-                convert_started = time.perf_counter()
-                diarization_path = processed_audio_path
-                convert_elapsed = time.perf_counter() - convert_started
-                logger.info("Pyannote audio : %s", diarization_path)
-                logger.info("Format         : WAV PCM 16-bit / mono / 16 kHz")
-                logger.info("Reuse preprocessed WAV (no second conversion)")
-                logger.info("---------- AUDIO CONVERT END -------")
+                convert_elapsed = 0.0
+                diarization_elapsed = 0.0
+                diarization = None
+                if speaker_diarization_enabled:
+                    logger.info("")
+                    logger.info("---------- AUDIO CONVERT START -----")
+                    convert_started = time.perf_counter()
+                    diarization_path = processed_audio_path
+                    convert_elapsed = time.perf_counter() - convert_started
+                    logger.info("Pyannote audio : %s", diarization_path)
+                    logger.info("Format         : WAV PCM 16-bit / mono / 16 kHz")
+                    logger.info("Reuse preprocessed WAV (no second conversion)")
+                    logger.info("---------- AUDIO CONVERT END -------")
 
                 # ====================================================
                 # PYANNOTE
                 # ====================================================
 
-                logger.info("")
-                logger.info("---------- PYANNOTE START ---------")
-                diarization_started = time.perf_counter()
+                    logger.info("")
+                    logger.info("---------- PYANNOTE START ---------")
+                    diarization_started = time.perf_counter()
+                    pipeline_instance = await asyncio.to_thread(get_diarization_pipeline)
 
-                def run_diarization():
-                    if num_speakers is not None:
-                        logger.info("Speaker mode : fixed (%d)", num_speakers)
-                        return diarization_pipeline(diarization_path, num_speakers=num_speakers)
-                    logger.info("Speaker mode : auto")
-                    return diarization_pipeline(diarization_path)
+                    def run_diarization():
+                        if num_speakers is not None:
+                            logger.info("Speaker mode : fixed (%d)", num_speakers)
+                            return pipeline_instance(diarization_path, num_speakers=num_speakers)
+                        logger.info("Speaker mode : auto")
+                        return pipeline_instance(diarization_path)
 
-                output = await asyncio.to_thread(run_diarization)
-                diarization = output.speaker_diarization
-                diarization_elapsed = time.perf_counter() - diarization_started
+                    output = await asyncio.to_thread(run_diarization)
+                    diarization = output.speaker_diarization
+                    diarization_elapsed = time.perf_counter() - diarization_started
+                else:
+                    logger.info("Pyannote skipped because speaker diarization is disabled")
         except BaseException:
             if gpu_lock.locked() is False:
                 async with waiting_jobs_lock:
@@ -466,56 +497,51 @@ async def transcribe(
         # LOG SPEAKER TIMELINE
         # ====================================================
 
-        logger.info("Speaker timeline:")
-        diarization_count = 0
-
-        for turn, speaker in diarization:
-            diarization_count += 1
-            logger.info("D[%03d] %.2f -> %.2f | %s", diarization_count, turn.start, turn.end, speaker)
-
-        speakers = diarization.labels()
-
-        logger.info("")
-        logger.info("Speaker count : %d", len(speakers))
-        logger.info("Speakers      : %s", speakers)
-        logger.info("Pyannote processing: %.2f sec", diarization_elapsed)
-        logger.info("---------- PYANNOTE END -----------")
+        if speaker_diarization_enabled:
+            logger.info("Speaker timeline:")
+            diarization_count = 0
+            for turn, speaker in diarization:
+                diarization_count += 1
+                logger.info("D[%03d] %.2f -> %.2f | %s", diarization_count, turn.start, turn.end, speaker)
+            speakers = diarization.labels()
+            logger.info("")
+            logger.info("Speaker count : %d", len(speakers))
+            logger.info("Speakers      : %s", speakers)
+            logger.info("Pyannote processing: %.2f sec", diarization_elapsed)
+            logger.info("---------- PYANNOTE END -----------")
+        else:
+            speakers = []
 
         # ====================================================
         # ASSIGN WHISPER SEGMENT -> SPEAKER
         # ====================================================
 
-        logger.info("")
-        logger.info("---------- ASSIGN START -----------")
-
-        assign_started = time.perf_counter()
-        result = []
-        unknown_count = 0
-
-        for segment in whisper_segments:
-            speaker = find_segment_speaker(diarization, segment["start"], segment["end"])
-
-            if speaker == "UNKNOWN":
-                unknown_count += 1
-
-            result.append({
-                "start": segment["start"],
-                "end": segment["end"],
-                "speaker": speaker,
-                "text": segment["text"]
-            })
-
-        raw_result_count = len(result)
-        result, speaker_map = remap_speakers_by_first_appearance(result)
-        result = merge_same_speaker_segments(result, max_gap=1.0, max_duration=30.0)
-        assign_elapsed = time.perf_counter() - assign_started
-
-        logger.info("Segments assigned : %d", raw_result_count)
-        logger.info("Speaker remap     : %s", speaker_map)
-        logger.info("Unknown segments  : %d", unknown_count)
-        logger.info("Final segments    : %d", len(result))
-        logger.info("Assign time       : %.3f sec", assign_elapsed)
-        logger.info("---------- ASSIGN END -------------")
+        assign_elapsed = 0.0
+        speaker_map = {}
+        if speaker_diarization_enabled:
+            logger.info("")
+            logger.info("---------- ASSIGN START -----------")
+            assign_started = time.perf_counter()
+            result = []
+            unknown_count = 0
+            for segment in whisper_segments:
+                speaker = find_segment_speaker(diarization, segment["start"], segment["end"])
+                if speaker == "UNKNOWN":
+                    unknown_count += 1
+                result.append({"start": segment["start"], "end": segment["end"], "speaker": speaker, "text": segment["text"]})
+            raw_result_count = len(result)
+            result, speaker_map = remap_speakers_by_first_appearance(result)
+            result = merge_same_speaker_segments(result, split_sentences=sentence_split_enabled, max_gap=max_gap, max_duration=max_duration)
+            assign_elapsed = time.perf_counter() - assign_started
+            logger.info("Segments assigned : %d", raw_result_count)
+            logger.info("Speaker remap     : %s", speaker_map)
+            logger.info("Unknown segments  : %d", unknown_count)
+            logger.info("Final segments    : %d", len(result))
+            logger.info("Assign time       : %.3f sec", assign_elapsed)
+            logger.info("---------- ASSIGN END -------------")
+        else:
+            result = whisper_segments
+            logger.info("Speaker assignment and merge skipped; returning original Whisper segments")
 
         # ====================================================
         # FINAL TRANSCRIPT
@@ -525,14 +551,10 @@ async def transcribe(
         logger.info("============== RESULT ==============")
 
         for index, item in enumerate(result, start=1):
-            logger.info(
-                "R[%03d] [%.2f - %.2f] %s: %s",
-                index,
-                item["start"],
-                item["end"],
-                item["speaker"],
-                item["text"]
-            )
+            if speaker_diarization_enabled:
+                logger.info("R[%03d] [%.2f - %.2f] %s: %s", index, item["start"], item["end"], item["speaker"], item["text"])
+            else:
+                logger.info("R[%03d] [%.2f - %.2f] %s", index, item["start"], item["end"], item["text"])
 
         logger.info("====================================")
 
@@ -568,6 +590,12 @@ async def transcribe(
             "model": model_name,
             "requestedLanguage": language_value,
             "requestedSpeakerCount": num_speakers,
+            "speakerDiarizationEnabled": speaker_diarization_enabled,
+            "sentenceSplit": {
+                "enabled": sentence_split_enabled,
+                "maxGap": max_gap if sentence_split_enabled else None,
+                "maxDuration": max_duration if sentence_split_enabled else None
+            },
             "vad": {
                 "enabled": vad_enabled,
                 "threshold": vad_threshold if vad_enabled else None,
@@ -601,4 +629,5 @@ async def transcribe(
         raise HTTPException(status_code=500, detail=str(ex))
     finally:
         safe_remove(diarization_path)
+        safe_remove(processed_audio_path)
         safe_remove(audio_path)

@@ -309,6 +309,7 @@ async def transcribe(
     sentence_split_enabled: bool = Form(True),
     max_gap: float = Form(1.0),
     max_duration: float = Form(30.0),
+    beam_size: int = Form(5),
     vad_enabled: bool = Form(True),
     vad_threshold: float = Form(0.2),
     vad_min_speech_ms: int = Form(50),
@@ -329,6 +330,8 @@ async def transcribe(
         raise HTTPException(status_code=400, detail="max_gap must be >= 0")
     if sentence_split_enabled and max_duration <= 0:
         raise HTTPException(status_code=400, detail="max_duration must be greater than 0")
+    if beam_size < 1:
+        raise HTTPException(status_code=400, detail="beam_size must be greater than 0")
     if not 0 <= vad_threshold <= 1:
         raise HTTPException(status_code=400, detail="vad_threshold must be between 0 and 1")
     if vad_min_speech_ms < 0 or vad_min_silence_ms < 0 or vad_speech_pad_ms < 0:
@@ -345,6 +348,7 @@ async def transcribe(
     logger.info("Sentence split : %s", "on" if sentence_split_enabled else "off")
     if sentence_split_enabled:
         logger.info("Merge cfg      : maxGap=%.2fs, maxDuration=%.2fs", max_gap, max_duration)
+    logger.info("Beam size : %d", beam_size)
     logger.info("VAD      : %s", "on" if vad_enabled else "off")
     if vad_enabled:
         logger.info("VAD cfg  : threshold=%.2f, minSpeech=%dms, minSilence=%dms, pad=%dms", vad_threshold, vad_min_speech_ms, vad_min_silence_ms, vad_speech_pad_ms)
@@ -413,8 +417,7 @@ async def transcribe(
                 logger.info("")
                 logger.info("---------- WHISPER START ----------")
                 whisper_started = time.perf_counter()
-                transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True, "initial_prompt": "句読点（、。！？）を適切に使用して、日本語の文章として文字起こししてください。"}
-                # transcribe_kwargs = {"language": whisper_language, "beam_size": 5, "word_timestamps": True, "vad_filter": vad_enabled, "condition_on_previous_text": True}
+                transcribe_kwargs = {"language": whisper_language, "beam_size": beam_size, "word_timestamps": False, "vad_filter": vad_enabled, "condition_on_previous_text": True, "initial_prompt": "句読点（、。！？）を適切に使用して、日本語の文章として文字起こししてください。"}
                 if vad_enabled:
                     transcribe_kwargs["vad_parameters"] = {"threshold": vad_threshold, "min_speech_duration_ms": vad_min_speech_ms, "min_silence_duration_ms": vad_min_silence_ms, "speech_pad_ms": vad_speech_pad_ms}
 
@@ -424,17 +427,9 @@ async def transcribe(
 
                 segments, info = await asyncio.to_thread(run_whisper)
                 whisper_segments = []
-                word_count = 0
 
                 for index, segment in enumerate(segments, start=1):
-                    segment_words = []
-                    if segment.words:
-                        for word in segment.words:
-                            if word.start is None or word.end is None:
-                                continue
-                            segment_words.append({"start": word.start, "end": word.end, "text": word.word})
-                            word_count += 1
-                    whisper_segments.append({"start": segment.start, "end": segment.end, "text": segment.text.strip(), "words": segment_words})
+                    whisper_segments.append({"start": segment.start, "end": segment.end, "text": segment.text.strip()})
                     logger.info("W[%03d] %.2f -> %.2f | %s", index, segment.start, segment.end, segment.text.strip())
 
                 whisper_elapsed = time.perf_counter() - whisper_started
@@ -443,7 +438,6 @@ async def transcribe(
                 logger.info("Language probability : %.4f", info.language_probability)
                 logger.info("Audio duration       : %.2f sec", info.duration)
                 logger.info("Whisper segments     : %d", len(whisper_segments))
-                logger.info("Whisper words        : %d", word_count)
                 logger.info("Whisper processing   : %.2f sec", whisper_elapsed)
                 logger.info("---------- WHISPER END ------------")
 
@@ -596,6 +590,7 @@ async def transcribe(
                 "maxGap": max_gap if sentence_split_enabled else None,
                 "maxDuration": max_duration if sentence_split_enabled else None
             },
+            "beamSize": beam_size,
             "vad": {
                 "enabled": vad_enabled,
                 "threshold": vad_threshold if vad_enabled else None,
@@ -608,7 +603,6 @@ async def transcribe(
             "duration": info.duration,
             "speakerCount": len(speaker_map),
             "speakers": list(speaker_map.values()),
-            "wordCount": word_count,
             "processingTime": {
                 "queueWait": round(queue_wait_elapsed, 3),
                 "preprocess": round(preprocess_elapsed, 3),
