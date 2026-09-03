@@ -1,5 +1,6 @@
 .venv/
 models/whisper
+audio/
 .env
 __pycache__/
 *.pyc
